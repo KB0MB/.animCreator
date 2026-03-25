@@ -1,295 +1,315 @@
 import os
-from fbx import FbxManager, FbxScene, FbxImporter, FbxAnimStack, FbxCriteria, FbxNode, FbxAnimCurve, FbxAnimCurveKey, FbxAnimLayer, FbxAnimCurveDef, FbxAnimCurveNode, FbxAnimCurveFilter, FbxAnimCurveFilterKeyReducer, FbxAnimCurveFilterConstantKeyReducer, FbxAnimCurveFilterUnroll, FbxAnimCurveFilterTSS, FbxAnimCurveFilterMatrixConverter, FbxAnimCurveFilterResample, FbxAnimCurveFilterKeySync, FbxAnimCurveFilterGimbleKiller, FbxAnimCurveFilterUnroll, FbxAnimCurveFilterConstantKeyReducer, FbxAnimCurveFilterTSS, FbxAnimCurveFilterMatrixConverter, FbxAnimCurveFilterResample, FbxAnimCurveFilterKeySync, FbxAnimCurveFilterGimbleKiller
 
-def find_bone_recursive(node, bone_name):
+from fbx import (
+    FbxAnimLayer,
+    FbxAnimStack,
+    FbxCriteria,
+    FbxNode,
+    FbxTime,
+    FbxSkeleton,
+)
+
+# ----------------------------
+# Small utilities
+# ----------------------------
+
+def get_fbx_time_mode(scene):
+    return scene.GetGlobalSettings().GetTimeMode()
+
+def fbx_time_to_frame(t, scene):
+    # Correct conversion according to the FBX's own time mode
+    return int(t.GetFrameCount(get_fbx_time_mode(scene)))
+
+def dedupe_same_frame(keys):
+    by_frame = {}
+    for k in keys:
+        by_frame[int(k["time"])] = k  # keeps last
+    return sorted(by_frame.values(), key=lambda k: k["time"])
+
+def simplify_axis_keys(axis_keys, value_epsilon=1e-6):
     """
-    Recursively search for a bone by name in the node hierarchy.
-    
-    Args:
-        node (FbxNode): The current FBX node being traversed.
-        bone_name (str): The name of the bone to find.
-        
-    Returns:
-        FbxNode: The bone node if found, otherwise None.
+    Remove redundant keys while preserving held poses.
+
+    Keeps:
+      - first key
+      - last key
+      - the last key before a value change
+      - the first key after a value change
+
+    Example:
+      A A A B B  ->  A A B B
+    so the value holds correctly until the change.
     """
-    if node.GetName() == bone_name:
-        return node
+    if len(axis_keys) <= 2:
+        return axis_keys
 
-    for i in range(node.GetChildCount()):
-        found_node = find_bone_recursive(node.GetChild(i), bone_name)
-        if found_node:
-            return found_node
+    simplified = [axis_keys[0]]
 
-    return None
+    for i in range(1, len(axis_keys) - 1):
+        prev_val = float(axis_keys[i - 1]["value"])
+        curr_val = float(axis_keys[i]["value"])
+        next_val = float(axis_keys[i + 1]["value"])
 
-def get_transform_key(transform, axis):
+        changed_from_prev = abs(curr_val - prev_val) > value_epsilon
+        changes_to_next = abs(curr_val - next_val) > value_epsilon
+
+        # Keep transition boundaries:
+        # - first key of new value
+        # - last key of old value
+        if changed_from_prev or changes_to_next:
+            simplified.append(axis_keys[i])
+
+    simplified.append(axis_keys[-1])
+    return simplified
+
+def get_transform_key(transform: str, axis: str) -> int:
     """
-    Get the correct key index for the transform (translate, rotate, scale) and axis (X, Y, Z).
+    Map transform+axis to Maya .anim channel index.
+
     translateX = 0, translateY = 1, translateZ = 2
-    rotateX = 3, rotateY = 4, rotateZ = 5
-    scaleX = 6, scaleY = 7, scaleZ = 8
+    rotateX    = 3, rotateY    = 4, rotateZ    = 5
+    scaleX     = 6, scaleY     = 7, scaleZ     = 8
     """
     key_map = {
-        'translate': {'X': 0, 'Y': 1, 'Z': 2},
-        'rotate': {'X': 3, 'Y': 4, 'Z': 5},
-        'scale': {'X': 6, 'Y': 7, 'Z': 8}
+        "translate": {"X": 0, "Y": 1, "Z": 2},
+        "rotate": {"X": 3, "Y": 4, "Z": 5},
+        "scale": {"X": 6, "Y": 7, "Z": 8},
     }
     return key_map[transform][axis]
 
-def export_single_animation(anim_original, save_path, scene, original_fps=25, target_fps=25):
+
+def time_unit_from_fps(fps: int) -> str:
+    """Best-effort mapping of FPS to Maya .anim timeUnit."""
+    mapping = {
+        15: "game",
+        24: "film",
+        25: "pal",
+        30: "ntsc",
+        48: "show",
+        50: "palf",
+        60: "ntscf",
+    }
+    return mapping.get(int(fps), "pal")
+
+
+def is_skeleton_node(node: FbxNode) -> bool:
+    """Robust skeleton detection for Python FBX bindings."""
+    if not node:
+        return False
+
+    attr = node.GetNodeAttribute()
+    if not attr:
+        return False
+
+    # Most reliable across bindings:
+    if isinstance(attr, FbxSkeleton):
+        return True
+
+    # Fallback (some bindings don't play nice with isinstance):
+    try:
+        return attr.GetClassId().Is(FbxSkeleton.ClassId)
+    except Exception:
+        return False
+
+
+# ----------------------------
+# Keyframe extraction (skeleton-only, node-safe)
+# ----------------------------
+
+def extract_keyframe_data_from_node(node: FbxNode, anim_layer: FbxAnimLayer, scene):
+    """Extract keyframes from LclTranslation/LclRotation/LclScaling curves."""
+    keyframe_data = []
+
+    anim_curves = {
+        "translateX": node.LclTranslation.GetCurve(anim_layer, "X"),
+        "translateY": node.LclTranslation.GetCurve(anim_layer, "Y"),
+        "translateZ": node.LclTranslation.GetCurve(anim_layer, "Z"),
+        "rotateX": node.LclRotation.GetCurve(anim_layer, "X"),
+        "rotateY": node.LclRotation.GetCurve(anim_layer, "Y"),
+        "rotateZ": node.LclRotation.GetCurve(anim_layer, "Z"),
+        "scaleX": node.LclScaling.GetCurve(anim_layer, "X"),
+        "scaleY": node.LclScaling.GetCurve(anim_layer, "Y"),
+        "scaleZ": node.LclScaling.GetCurve(anim_layer, "Z"),
+    }
+
+    for curve_name, curve in anim_curves.items():
+        if not curve:
+            continue
+
+        for i in range(curve.KeyGetCount()):
+            key = curve.KeyGet(i)
+            keyframe_data.append(
+                {
+                    "curve": curve_name,
+                    # Store as 0-based in target fps here; export adds +1 so Maya starts at 1
+                    "time": fbx_time_to_frame(key.GetTime(), scene),
+                    "value": key.GetValue(),
+                }
+            )
+
+    return keyframe_data
+
+
+def get_skeleton_bones_with_keyframes(anim_stack: FbxAnimStack, scene, ignored_bones):
+    """Return list of (node, keyframes) for skeleton nodes with any keys."""
+    ignored_bones = ignored_bones or set()
+
+    results = []
+    anim_layer = anim_stack.GetMember(FbxAnimLayer.ClassId, 0)
+    if not anim_layer:
+        return results
+
+    node_count = scene.GetSrcObjectCount(FbxCriteria.ObjectType(FbxNode.ClassId))
+    for i in range(node_count):
+        node = scene.GetSrcObject(FbxCriteria.ObjectType(FbxNode.ClassId), i)
+        if not node:
+            continue
+
+        if not is_skeleton_node(node):
+            continue
+
+        bone_name = node.GetName()
+        if bone_name in ignored_bones:
+            continue
+
+        keyframes = extract_keyframe_data_from_node(node, anim_layer, scene)
+        if keyframes:
+            results.append((node, keyframes))
+
+    return results
+
+
+# ----------------------------
+# Export
+# ----------------------------
+
+def export_single_animation(
+    anim_original: str,
+    save_path: str,
+    scene,
+    ignored_bones=None,
+):
     """
-    Export a single animation to the specified path in .anim format.
-    Args:
-        anim_original (str): The original animation name.
-        save_path (str): The path to save the exported animation.
-        scene (FbxScene): The FBX scene containing the animation.
-        original_fps (int): The frame rate of the original animation (default is 25).
-        target_fps (int): The desired frame rate of the exported animation (default is 25).
+    Export a single FBX AnimStack to a Maya .anim file.
+
+    Notes:
+    - Skeleton-only export (no meshes/nulls/cameras).
+    - Keys are shifted so animation starts at frame 1.
     """
+
     print(f"Exporting animation: {anim_original} to {save_path}")
+    ignored_bones = ignored_bones or set()
 
-    # Find the correct animation stack in the FBX scene
-    anim_stack_count = scene.GetSrcObjectCount(FbxCriteria.ObjectType(FbxAnimStack.ClassId))
-    
-    for i in range(anim_stack_count):
-        anim_stack = scene.GetSrcObject(FbxCriteria.ObjectType(FbxAnimStack.ClassId), i)
+    # Find animation stack by exact name
+    anim_stack = None
+    count = scene.GetSrcObjectCount(FbxCriteria.ObjectType(FbxAnimStack.ClassId))
+    for i in range(count):
+        stack = scene.GetSrcObject(FbxCriteria.ObjectType(FbxAnimStack.ClassId), i)
+        if stack and stack.GetName() == anim_original:
+            anim_stack = stack
+            break
 
-        if anim_stack.GetName() == anim_original:
-            print(f"Found animation stack: {anim_original}")
+    if not anim_stack:
+        print(f"Animation stack {anim_original} not found.")
+        return
 
-            # Extract keyframe data
-            keyframe_data = get_bones_with_keyframes(anim_stack, scene)
+    bones = get_skeleton_bones_with_keyframes(anim_stack, scene, ignored_bones)
+    if not bones:
+        print("No animated skeleton bones found.")
+        return
 
-            # Skip the first bone entirely (assumed to be the armature)
-            if len(keyframe_data) > 1:
-                keyframe_data = keyframe_data[1:]  # Exclude the first bone in the list
+    # Collect all key times (0-based) to compute end
+    all_key_times = [kf["time"] for _, keys in bones for kf in keys]
 
-            # Collect all keyframe times to determine start and end times
-            all_keyframe_times = [kf['time'] for _, bone_keyframes in keyframe_data for kf in bone_keyframes]
+    if all_key_times:
+        start_time = min(all_key_times)
+        end_time = max(all_key_times)
+    else:
+        start_time = 0
+        end_time = 0
 
-            if all_keyframe_times:
-                start_time = 0  # First frame should always be 0
-                end_time = max(all_keyframe_times)  # Use the max frame as the end time
-                print(f"Calculated frame range: start_time={start_time}, end_time={end_time}")
+    # Write .anim
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("animVersion 1.1;\n")
+        f.write("mayaVersion 2025;\n")
+        f.write(f"timeUnit pal;\n")
+        f.write("linearUnit cm;\n")
+        f.write("angularUnit deg;\n")
+        f.write(f"startTime {start_time};\n")
+        f.write(f"endTime {end_time};\n")
 
-                # If frame rate conversion is needed
-                if original_fps != target_fps:
-                    scale_factor = original_fps / target_fps
-                    print(f"Scaling keyframes by factor: {scale_factor}")
-                    for bone_name, bone_keyframes in keyframe_data:
-                        for keyframe in bone_keyframes:
-                            keyframe['time'] = int(keyframe['time'] * scale_factor)
-            else:
-                start_time = 0
-                end_time = 0
+        for node, keyframes in bones:
+            bone_name = node.GetName()
+            child_count = node.GetChildCount()
 
-            # Write the data to the .anim file
-            with open(save_path, 'w') as file:
-                # Write basic headers
-                file.write("animVersion 1.1;\n")
-                file.write("mayaVersion 2025;\n")
-                file.write("timeUnit pal;\n")  # Make sure it uses 'pal' for 25 FPS
-                file.write("linearUnit cm;\n")
-                file.write("angularUnit deg;\n")
-                file.write(f"startTime {start_time};\n")
-                file.write(f"endTime {end_time};\n")
+            for transform in ("translate", "rotate", "scale"):
+                for axis in ("X", "Y", "Z"):
+                    curve_name = f"{transform}{axis}"  # e.g. translateX
+                    axis_keys = [k for k in keyframes if k["curve"] == curve_name]
+                    if not axis_keys:
+                        continue
 
-                # Export keyframes for each bone and transform
-                for bone_name, bone_keyframes in keyframe_data:
-                    bone = scene.FindNodeByName(bone_name)
+                    # Sort (FBX can sometimes return out of order)
+                    axis_keys.sort(key=lambda k: k["time"])
+                    axis_keys = dedupe_same_frame(axis_keys)
+                    axis_keys = simplify_axis_keys(axis_keys, value_epsilon=1e-6)
 
-                    for transform in ['translate', 'rotate', 'scale']:
-                        for axis in ['X', 'Y', 'Z']:
-                            # Filter keyframes by curve
-                            axis_keyframes = [kf for kf in bone_keyframes if kf['curve'] == f"{transform}{axis}"]
+                    if not axis_keys:
+                        continue
 
-                            if axis_keyframes:
-                                file.write(f"anim {transform}.{transform}{axis} {transform}{axis} {bone_name} 0 {bone.GetChildCount()} {get_transform_key(transform, axis)};\n")
-                                file.write("animData {\n")
-                                file.write("  input time;\n")
-                                file.write("  output linear;\n")
-                                file.write("  weighted 0;\n")
-                                file.write("  preInfinity constant;\n")
-                                file.write("  postInfinity constant;\n")
 
-                                file.write("  keys {\n")
-                                for idx, keyframe in enumerate(axis_keyframes):
-                                    time = int(keyframe['time'])  # Ensure correct timing based on frame rate
-                                    value = keyframe['value']
-                                    if value.is_integer():
-                                        value = int(value)
+                    # Channel header
+                    f.write(
+                        f"anim {transform}.{curve_name} {curve_name} {bone_name} 0 {child_count} {get_transform_key(transform, axis)};\n"
+                    )
+                    f.write("animData {\n")
+                    f.write("  input time;\n")
+                    f.write("  output linear;\n")
+                    f.write("  weighted 0;\n")
+                    f.write("  preInfinity constant;\n")
+                    f.write("  postInfinity constant;\n")
+                    f.write("  keys {\n")
 
-                                    # Write keyframe
-                                    if idx == 0:
-                                        file.write(f"    {time} {value} fixed fixed 1 0 0 0 1 0 1;\n")
-                                    else:
-                                        file.write(f"    {time} {value} linear linear 1 0 0;\n")
+                    for idx, kf in enumerate(axis_keys):
+                        time_exact = int(kf["time"])   # <- no shift
+                        value = kf["value"]
 
-                                file.write("  }\n")
-                                file.write("}\n")
+                        # Safe integer formatting
+                        if isinstance(value, float) and value.is_integer():
+                            value = int(value)
+
+                        if idx == 0:
+                            f.write(f"    {time_exact} {value} fixed fixed 1 0 0 0 1 0 1;\n")
+                        else:
+                            f.write(f"    {time_exact} {value} linear linear 1 0 0;\n")
+
+
+                    f.write("  }\n")
+                    f.write("}\n")
 
     print(f"Animation {anim_original} exported successfully.")
 
-def export_all_animations(animations, export_dir, scene, original_fps=25, target_fps=25):
-    """
-    Export all animations to the specified directory.
 
-    Args:
-        animations (list): List of animation names to export.
-        export_dir (str): Directory to save the exported animations.
-        scene (FbxScene): The FBX scene containing the animations.
-        original_fps (int): Original FPS of animations.
-        target_fps (int): Desired FPS of exported animations.
+def export_all_animations(animations, export_dir, scene, ignored_bones=set()):
+    """
+    animations can be:
+      - list[str] of original stack names (legacy)
+      - list[tuple[str,str]] of (original_stack, display_name) (new)
     """
     if not os.path.exists(export_dir):
-        os.makedirs(export_dir)  # Ensure the directory exists
-    
-    for anim in animations:
-        save_path = os.path.join(export_dir, f"{anim}.anim")
+        os.makedirs(export_dir)
 
-        # Ensure that each animation starts fresh with its own keyframe data
-        print(f"Starting export for animation: {anim}")
-        export_single_animation(anim, save_path, scene, original_fps, target_fps)
-
-    print("All animations exported successfully!")
-
-def get_animation_keyframes(anim_stack, scene):
-    """
-    Extracts keyframe data from the animation stack and scene.
-
-    Args:
-        anim_stack (FbxAnimStack): The animation stack containing the animation data.
-        scene (FbxScene): The FBX scene containing the animation and bone structure.
-
-    Returns:
-        List[dict]: A list of keyframe data for each bone in the scene.
-    """
-    bones_with_keyframes = []
-
-    # Print the animation stack name for debugging
-    print(f"Using animation stack: {anim_stack.GetName()}")
-
-    # Get the first animation layer from the stack
-    anim_layer = anim_stack.GetMember(FbxAnimLayer.ClassId, 0)
-    if not anim_layer:
-        print(f"No animation layers found in stack: {anim_stack.GetName()}")
-        return []
-
-    # Print the animation layer name for debugging
-    print(f"Using animation layer: {anim_layer.GetName()}")
-
-    # Iterate through all nodes in the scene to find bones with animation data
-    node_count = scene.GetSrcObjectCount(FbxCriteria.ObjectType(FbxNode.ClassId))
-    
-    for i in range(node_count):
-        node = scene.GetSrcObject(FbxCriteria.ObjectType(FbxNode.ClassId), i)
-        bone_name = node.GetName()
-
-        print(f"Checking bone: {bone_name}")
-
-        # Pass both the node and the anim_layer to the function
-        keyframe_data = extract_keyframe_data_from_node(node, anim_layer)  # Correctly pass both arguments
-        
-        if keyframe_data:
-            print(f"Keyframes found for bone: {bone_name}")
-            bones_with_keyframes.append((bone_name, keyframe_data))
+    for item in animations:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            original_stack, display_name = item[0], item[1]
         else:
-            print(f"No keyframes found for bone: {bone_name}")
-    
-    return bones_with_keyframes
+            original_stack, display_name = item, item
 
-def get_bones_with_keyframes(anim_stack, scene):
-    """
-    Extract all bones that have keyframe data in the FBX scene.
+        save_path = os.path.join(export_dir, f"{display_name}.anim")
+        export_single_animation(
+            original_stack,
+            save_path,
+            scene,
+            ignored_bones=ignored_bones,
+        )
 
-    Args:
-        anim_stack (FbxAnimStack): The animation stack containing the animation data.
-        scene (FbxScene): The FBX scene containing the animation and bone structure.
-
-    Returns:
-        List[Tuple[str, List[dict]]]: A list of tuples where each tuple contains a bone name and its associated keyframe data.
-    """
-    bones_with_keyframes = []
-
-    # Print the animation stack name for debugging
-    print(f"Using animation stack: {anim_stack.GetName()}")
-
-    # Get the first animation layer from the stack
-    anim_layer = anim_stack.GetMember(FbxAnimLayer.ClassId, 0)
-    if not anim_layer:
-        print(f"No animation layers found in stack: {anim_stack.GetName()}")
-        return []
-
-    # Print the animation layer name
-    print(f"Using animation layer: {anim_layer.GetName()}")
-
-    # Iterate through all nodes in the scene to find bones with animation data
-    node_count = scene.GetSrcObjectCount(FbxCriteria.ObjectType(FbxNode.ClassId))
-    
-    for i in range(node_count):
-        node = scene.GetSrcObject(FbxCriteria.ObjectType(FbxNode.ClassId), i)
-        bone_name = node.GetName()
-
-        print(f"Checking bone: {bone_name}")
-
-        # Pass both the node and the anim_layer to the function
-        keyframe_data = extract_keyframe_data_from_node(node, anim_layer)
-        
-        if keyframe_data:
-            print(f"Keyframes found for bone: {bone_name}")
-            bones_with_keyframes.append((bone_name, keyframe_data))
-        else:
-            print(f"No keyframes found for bone: {bone_name}")
-    
-    return bones_with_keyframes
-
-
-def extract_keyframe_data_from_node(node, anim_layer):
-    """
-    Extract keyframe data from a node (bone) in the FBX scene.
-
-    Args:
-        node (FbxNode): The node (bone) from which to extract keyframe data.
-        anim_layer (FbxAnimLayer): The animation layer containing keyframe data.
-
-    Returns:
-        List[dict]: A list of keyframe data dictionaries.
-    """
-    keyframe_data = []
-
-    # Access the animation curves for each transform (translate, rotate, scale) in the current animation layer
-    anim_curves = {
-        "translateX": node.LclTranslation.GetCurve(anim_layer, 'X'),
-        "translateY": node.LclTranslation.GetCurve(anim_layer, 'Y'),
-        "translateZ": node.LclTranslation.GetCurve(anim_layer, 'Z'),
-        "rotateX": node.LclRotation.GetCurve(anim_layer, 'X'),
-        "rotateY": node.LclRotation.GetCurve(anim_layer, 'Y'),
-        "rotateZ": node.LclRotation.GetCurve(anim_layer, 'Z'),
-        "scaleX": node.LclScaling.GetCurve(anim_layer, 'X'),
-        "scaleY": node.LclScaling.GetCurve(anim_layer, 'Y'),
-        "scaleZ": node.LclScaling.GetCurve(anim_layer, 'Z'),
-    }
-
-    # Iterate through each animation curve and extract keyframe data
-    for curve_name, curve in anim_curves.items():
-        if curve:  # If the curve exists for this transform
-            keyframe_count = curve.KeyGetCount()
-
-            for key_index in range(keyframe_count):
-                key = curve.KeyGet(key_index)
-                keyframe_data.append({
-                    "curve": curve_name,                  # Store which curve (transform + axis) this keyframe belongs to
-                    "time": key.GetTime().GetFrameCount(),  # Convert FBX time to frame
-                    "value": key.GetValue(),                # Value of the transform at this keyframe
-                    "interp_in": "linear",                  # Interpolation type (can adjust based on actual curve data)
-                    "interp_out": "linear",                 # Interpolation type (can adjust based on actual curve data)
-                    "weight_in": 1,                         # Default weight
-                    "weight_out": 1,                        # Default weight
-                    "tangent_in": 0,                        # Default tangent
-                    "tangent_out": 0                        # Default tangent
-                })
-
-    if not keyframe_data:
-        print(f"No keyframe data found for node: {node.GetName()}")
-
-    return keyframe_data
