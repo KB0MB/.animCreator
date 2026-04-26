@@ -28,7 +28,6 @@ Ctrl + Click (arrow) → Expand full child hierarchy
 
 # ⚠️ Important
 
-## **Your version of Switch Toolbox includes a BrawlboxHelper.dll (22 KB):**
+## **Switch Toolbox includes a BrawlboxHelper.dll (22 KB) in the Lib folder:**
 
-## Replace it with the updated version
-## This resolves a frame count import issue **AND** allows for bones with no scale or location data to be imported.(Previously, if no location or scale was presentg duyring import, it would crumble the model)
+Replace it with the updated version. This resolves a frame count import issue **AND** allows for bones with no scale or location data to be imported.(Previously, if no location or scale was presentg duyring import, it would crumble the model)
