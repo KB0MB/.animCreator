@@ -1,18 +1,34 @@
-# .animCreator
+#🎬 Anim Creator 2.0
 
-## Overview
-This app lets you export animations or actions from an FBX file—whether exported from Blender or MAYA—into .anim format. You can choose to export individual animations or export them all at once by selecting the "Export All Animations" button. Additionally, you can right-click on an animation to delete, rename, or export it individually.
+Anim Creator is a tool designed to export clean, optimized **.anim** files.
 
-## Using Blender
+#🚀 Features
 
-### 1. Frame Rate Setting
-Ensure the frame rate in the Output tab of Blender’s properties editor is set to **30 FPS**. This will help maintain the animation’s original frame count and prevent any time-stretching.
+##🦴 Optimized Bone Export
+Exports only keyed frames (no unnecessary frame spam)
+Eliminates duplicate frame entries
 
-### 2. Clean Up Unused Bones
-Before exporting, make sure only the bones with actual animation data are present. Even if a bone doesn't have keyframes in Blender, the app will still generate them. To avoid this, you might want to create different Blend files tailored to your needs. Also, verify that no keyframe data exists for bones you’ve deleted. You can remove unwanted keyframes by clicking on the empty space in your scene and deleting them via the Dope Sheet. (Otherwise, the animations may not appear in the app. These two issues are because of Blender itself. If the "Key All Bones" option actually worked properly, there'd be no need for any deleted bones. Also, if Blender ignored the extra keyframes from the deleted bones, it would export the animations)
+**Result**: Smaller file sizes and cleaner animations.
 
-### 3. FBX Export Settings
-When exporting to FBX, go to the **Include** section and select only the armature. Skip the next section and proceed to **Armature**, where you should uncheck "Add Leaf Bones." Then, under the **Animation** section, uncheck "NLA Strips" and set the **Simplify** value to 0.
+##⚙️ Stable Export Behavior
+Handles different source framerates consistently and prevents animation length issues caused by FPS mismatches.(if **Auto FPS** is enabled in settings)
 
-## Conclusion
-Once set up, the process is straightforward. If you encounter any bugs or have questions, feel free to reach out. If you’d like to contribute improvements to the software, DM me on Discord at **kb0mbyolo**!
+**Result**: Reliable exports regardless of Blender scene settings.
+
+##⌨️ Shortcuts
+
+Ctrl + R — Rename selected animation
+Ctrl + E — Export selected animation
+Ctrl + C — Delete selected animation
+
+##🦴 Bone Selection Controls
+Shift + Click → Select a bone and all its children
+Ctrl + Click (arrow) → Expand full child hierarchy
+
+
+#⚠️ Important
+
+##**Your version of Switch Toolbox includes a BrawlboxHelper.dll (22 KB):**
+
+##Replace it with the updated version
+##This resolves a frame count import issue **AND** allows for bones with no scale or location data to be imported.(Previously, if no location or scale was presentg duyring import, it would crumble the model)
