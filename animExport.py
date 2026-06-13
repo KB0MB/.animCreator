@@ -5,8 +5,8 @@ from fbx import (
     FbxAnimStack,
     FbxCriteria,
     FbxNode,
-    FbxTime,
     FbxSkeleton,
+    FbxTime,
 )
 
 # ----------------------------
@@ -16,9 +16,19 @@ from fbx import (
 def get_fbx_time_mode(scene):
     return scene.GetGlobalSettings().GetTimeMode()
 
-def fbx_time_to_frame(t, scene):
-    # Correct conversion according to the FBX's own time mode
-    return int(t.GetFrameCount(get_fbx_time_mode(scene)))
+def fbx_time_to_frame(t, scene, auto_set_fps=True):
+    if auto_set_fps:
+        # True behavior: respect FBX scene framerate
+        return int(t.GetFrameCount(get_fbx_time_mode(scene)))
+
+    # Feature behavior: force conversion to 25 fps
+    if hasattr(FbxTime, "ePAL"):
+        return int(t.GetFrameCount(FbxTime.ePAL))
+
+    # If this FBX binding lacks ePAL, fall back to raw time conversion
+    # using seconds so the scaling feature still works.
+    seconds = t.GetSecondDouble()
+    return int(round(seconds * 30.0))
 
 def dedupe_same_frame(keys):
     by_frame = {}
@@ -26,41 +36,109 @@ def dedupe_same_frame(keys):
         by_frame[int(k["time"])] = k  # keeps last
     return sorted(by_frame.values(), key=lambda k: k["time"])
 
-def simplify_axis_keys(axis_keys, value_epsilon=1e-6):
+def simplify_linear_keys(keys, epsilon=1e-6):
     """
-    Remove redundant keys while preserving held poses.
+    Removes middle keys that lie on a straight line.
+    Expects keys shaped like:
+        {"time": ..., "value": ...}
+    Preserves the original dicts.
+    """
+    if len(keys) <= 2:
+        return keys
 
-    Keeps:
-      - first key
-      - last key
-      - the last key before a value change
-      - the first key after a value change
+    simplified = [keys[0]]
+
+    for i in range(1, len(keys) - 1):
+        prev = simplified[-1]
+        curr = keys[i]
+        next_k = keys[i + 1]
+
+        f0, v0 = float(prev["time"]), float(prev["value"])
+        f1, v1 = float(curr["time"]), float(curr["value"])
+        f2, v2 = float(next_k["time"]), float(next_k["value"])
+
+        # Avoid divide-by-zero / duplicate-time weirdness
+        if abs(f2 - f0) <= 1e-12:
+            simplified.append(curr)
+            continue
+
+        t = (f1 - f0) / (f2 - f0)
+        expected = v0 + (v2 - v0) * t
+
+        if abs(v1 - expected) > epsilon:
+            simplified.append(curr)
+
+    simplified.append(keys[-1])
+    return simplified
+
+def collapse_flat_channel(axis_keys, start_time, flat_tolerance=0.045):
+    """
+    Collapse the whole channel to the animation start frame if every key
+    stays within ±flat_tolerance of the first value.
 
     Example:
-      A A A B B  ->  A A B B
-    so the value holds correctly until the change.
+      base = 90.0
+      flat_tolerance = 0.035
+
+      Allowed range:
+        89.965 to 90.035
     """
-    if len(axis_keys) <= 2:
+    if len(axis_keys) <= 1:
         return axis_keys
 
-    simplified = [axis_keys[0]]
+    base_value = float(axis_keys[0]["value"])
 
-    for i in range(1, len(axis_keys) - 1):
-        prev_val = float(axis_keys[i - 1]["value"])
-        curr_val = float(axis_keys[i]["value"])
-        next_val = float(axis_keys[i + 1]["value"])
+    for k in axis_keys[1:]:
+        if abs(float(k["value"]) - base_value) > flat_tolerance:
+            return axis_keys
 
-        changed_from_prev = abs(curr_val - prev_val) > value_epsilon
-        changes_to_next = abs(curr_val - next_val) > value_epsilon
+    return [{
+        "time": start_time,
+        "value": base_value,
+        "curve": axis_keys[0]["curve"],
+    }]
 
-        # Keep transition boundaries:
-        # - first key of new value
-        # - last key of old value
-        if changed_from_prev or changes_to_next:
-            simplified.append(axis_keys[i])
+def collapse_constant_channel(axis_keys, start_time, tolerance=1e-5):
+    """
+    Collapse the whole channel to the animation start frame if every key
+    stays within ±tolerance of the first value.
+    Good for nearly constant location channels with tiny float wobble.
+    """
+    if len(axis_keys) <= 1:
+        return axis_keys
 
-    simplified.append(axis_keys[-1])
-    return simplified
+    base_value = float(axis_keys[0]["value"])
+
+    for k in axis_keys[1:]:
+        if abs(float(k["value"]) - base_value) > tolerance:
+            return axis_keys
+
+    return [{
+        "time": start_time,
+        "value": base_value,
+        "curve": axis_keys[0]["curve"],
+    }]
+
+def collapse_nearly_constant_channel(axis_keys, start_time, epsilon=1e-6):
+    """
+    Collapse to animation start frame if every key is essentially identical
+    to the first value within a very strict epsilon.
+    Safe for all channel types.
+    """
+    if len(axis_keys) <= 1:
+        return axis_keys
+
+    base_value = float(axis_keys[0]["value"])
+
+    for k in axis_keys[1:]:
+        if abs(float(k["value"]) - base_value) > epsilon:
+            return axis_keys
+
+    return [{
+        "time": start_time,
+        "value": base_value,
+        "curve": axis_keys[0]["curve"],
+    }]
 
 def get_transform_key(transform: str, axis: str) -> int:
     """
@@ -76,21 +154,6 @@ def get_transform_key(transform: str, axis: str) -> int:
         "scale": {"X": 6, "Y": 7, "Z": 8},
     }
     return key_map[transform][axis]
-
-
-def time_unit_from_fps(fps: int) -> str:
-    """Best-effort mapping of FPS to Maya .anim timeUnit."""
-    mapping = {
-        15: "game",
-        24: "film",
-        25: "pal",
-        30: "ntsc",
-        48: "show",
-        50: "palf",
-        60: "ntscf",
-    }
-    return mapping.get(int(fps), "pal")
-
 
 def is_skeleton_node(node: FbxNode) -> bool:
     """Robust skeleton detection for Python FBX bindings."""
@@ -116,7 +179,7 @@ def is_skeleton_node(node: FbxNode) -> bool:
 # Keyframe extraction (skeleton-only, node-safe)
 # ----------------------------
 
-def extract_keyframe_data_from_node(node: FbxNode, anim_layer: FbxAnimLayer, scene):
+def extract_keyframe_data_from_node(node: FbxNode, anim_layer: FbxAnimLayer, scene, auto_set_fps=True):
     """Extract keyframes from LclTranslation/LclRotation/LclScaling curves."""
     keyframe_data = []
 
@@ -141,8 +204,7 @@ def extract_keyframe_data_from_node(node: FbxNode, anim_layer: FbxAnimLayer, sce
             keyframe_data.append(
                 {
                     "curve": curve_name,
-                    # Store as 0-based in target fps here; export adds +1 so Maya starts at 1
-                    "time": fbx_time_to_frame(key.GetTime(), scene),
+                    "time": fbx_time_to_frame(key.GetTime(), scene, auto_set_fps=auto_set_fps),
                     "value": key.GetValue(),
                 }
             )
@@ -150,7 +212,7 @@ def extract_keyframe_data_from_node(node: FbxNode, anim_layer: FbxAnimLayer, sce
     return keyframe_data
 
 
-def get_skeleton_bones_with_keyframes(anim_stack: FbxAnimStack, scene, ignored_bones):
+def get_skeleton_bones_with_keyframes(anim_stack: FbxAnimStack, scene, ignored_bones, auto_set_fps=True):
     """Return list of (node, keyframes) for skeleton nodes with any keys."""
     ignored_bones = ignored_bones or set()
 
@@ -172,7 +234,7 @@ def get_skeleton_bones_with_keyframes(anim_stack: FbxAnimStack, scene, ignored_b
         if bone_name in ignored_bones:
             continue
 
-        keyframes = extract_keyframe_data_from_node(node, anim_layer, scene)
+        keyframes = extract_keyframe_data_from_node(node, anim_layer, scene, auto_set_fps=auto_set_fps)
         if keyframes:
             results.append((node, keyframes))
 
@@ -188,6 +250,12 @@ def export_single_animation(
     save_path: str,
     scene,
     ignored_bones=None,
+    location_ignored_bones=None,
+    write_scale=True,
+    use_linear_reduction=True,
+    auto_set_fps=True,
+    reverse_animation=False,
+    rotation_linear_epsilon=3e-3,
 ):
     """
     Export a single FBX AnimStack to a Maya .anim file.
@@ -199,6 +267,7 @@ def export_single_animation(
 
     print(f"Exporting animation: {anim_original} to {save_path}")
     ignored_bones = ignored_bones or set()
+    location_ignored_bones = location_ignored_bones or set()
 
     # Find animation stack by exact name
     anim_stack = None
@@ -213,7 +282,7 @@ def export_single_animation(
         print(f"Animation stack {anim_original} not found.")
         return
 
-    bones = get_skeleton_bones_with_keyframes(anim_stack, scene, ignored_bones)
+    bones = get_skeleton_bones_with_keyframes(anim_stack, scene, ignored_bones, auto_set_fps=auto_set_fps)
     if not bones:
         print("No animated skeleton bones found.")
         return
@@ -242,7 +311,14 @@ def export_single_animation(
             bone_name = node.GetName()
             child_count = node.GetChildCount()
 
-            for transform in ("translate", "rotate", "scale"):
+            transforms = ["translate", "rotate"]
+            if write_scale:
+                transforms.append("scale")
+
+            for transform in transforms:
+                if transform == "translate" and bone_name in location_ignored_bones:
+                    continue
+
                 for axis in ("X", "Y", "Z"):
                     curve_name = f"{transform}{axis}"  # e.g. translateX
                     axis_keys = [k for k in keyframes if k["curve"] == curve_name]
@@ -252,8 +328,27 @@ def export_single_animation(
                     # Sort (FBX can sometimes return out of order)
                     axis_keys.sort(key=lambda k: k["time"])
                     axis_keys = dedupe_same_frame(axis_keys)
-                    axis_keys = simplify_axis_keys(axis_keys, value_epsilon=1e-6)
 
+                    if reverse_animation:
+                        axis_keys = reverse_axis_keys(axis_keys, start_time, end_time)
+
+                    if use_linear_reduction:
+                        if transform in ("translate", "scale"):
+                            axis_keys = collapse_constant_channel(axis_keys, start_time, tolerance=1e-5)
+
+                        elif transform == "rotate":
+                            axis_keys = collapse_flat_channel(axis_keys, start_time, flat_tolerance=0.11)
+                        if len(axis_keys) > 2:
+                            if transform == "translate":
+                                linear_epsilon = 1e-6
+                            elif transform == "rotate":
+                                linear_epsilon = rotation_linear_epsilon
+
+                            while True:
+                                new_axis_keys = simplify_linear_keys(axis_keys, epsilon=linear_epsilon)
+                                if len(new_axis_keys) == len(axis_keys):
+                                    break
+                                axis_keys = new_axis_keys
                     if not axis_keys:
                         continue
 
@@ -290,7 +385,18 @@ def export_single_animation(
     print(f"Animation {anim_original} exported successfully.")
 
 
-def export_all_animations(animations, export_dir, scene, ignored_bones=set()):
+def export_all_animations(
+    animations,
+    export_dir,
+    scene,
+    ignored_bones=set(),
+    location_ignored_bones=set(),
+    write_scale=True,
+    use_linear_reduction=True,
+    auto_set_fps=True,
+    reverse_animation=False,
+    rotation_linear_epsilon=3e-3,
+):
     """
     animations can be:
       - list[str] of original stack names (legacy)
@@ -311,5 +417,28 @@ def export_all_animations(animations, export_dir, scene, ignored_bones=set()):
             save_path,
             scene,
             ignored_bones=ignored_bones,
+            location_ignored_bones=location_ignored_bones,
+            write_scale=write_scale,
+            use_linear_reduction=use_linear_reduction,
+            auto_set_fps=auto_set_fps,
+            reverse_animation=reverse_animation,
+            rotation_linear_epsilon=rotation_linear_epsilon,
         )
 
+def reverse_axis_keys(axis_keys, start_time, end_time):
+    """
+    Reverse key timing across the animation span.
+    Example:
+      start=0, end=20
+      key at 3 becomes 17
+      key at 20 becomes 0
+    """
+    reversed_keys = []
+    for k in axis_keys:
+        reversed_keys.append({
+            "time": start_time + end_time - int(k["time"]),
+            "value": k["value"],
+            "curve": k["curve"],
+        })
+    reversed_keys.sort(key=lambda x: x["time"])
+    return dedupe_same_frame(reversed_keys)

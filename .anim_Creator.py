@@ -54,6 +54,10 @@ class FBXToAnimConverterApp:
         # Load settings from the JSON file
         self.settings = self.load_settings()
 
+        self.rotation_linear_epsilon = float(
+            self.settings.get("rotation_linear_epsilon", 3e-3)
+        )
+
         self.auto_set_fps = self.settings.get("auto_set_fps", True)
 
         self.theme_var = tk.StringVar(value=self.settings.get("theme", "Blue"))
@@ -94,8 +98,9 @@ class FBXToAnimConverterApp:
             "window_position": "100x100",
             "ignored_bones_presets": {},
             "location_ignored_bones_presets": {},
-            "auto_set_fps": True
-        }
+            "auto_set_fps": True,
+            "rotation_linear_epsilon": 3e-3,
+            }
 
         if os.path.exists(settings_file):
             try:
@@ -1230,6 +1235,12 @@ class FBXToAnimConverterApp:
         )
         self.auto_fps_toggle_button.pack(pady=(5, 10))
 
+        ctk.CTkLabel(self.settings_frame, text="Rotation Clean Epsilon:").pack(pady=(10, 6))
+
+        self.rotation_epsilon_entry = ctk.CTkEntry(self.settings_frame, width=120)
+        self.rotation_epsilon_entry.insert(0, str(self.rotation_linear_epsilon))
+        self.rotation_epsilon_entry.pack(pady=(0, 10))
+
         # Store Save button as an instance variable for color updates
         self.save_button = ctk.CTkButton(self.settings_frame, text="Save", command=self.save_export_directory)
         self.save_button.pack(pady=20)
@@ -1650,6 +1661,7 @@ class FBXToAnimConverterApp:
             use_linear_reduction=self.use_linear_reduction,
             auto_set_fps=self.auto_set_fps,
             reverse_animation=self.reverse_animation,
+            rotation_linear_epsilon=self.rotation_linear_epsilon,
         )
 
 
@@ -1676,6 +1688,8 @@ class FBXToAnimConverterApp:
             write_scale=self.write_scale,
             use_linear_reduction=self.use_linear_reduction,
             auto_set_fps=self.auto_set_fps,
+            reverse_animation=self.reverse_animation,
+            rotation_linear_epsilon=self.rotation_linear_epsilon,
         )
 
         self.set_status("All animations exported successfully!", is_error=False)
@@ -1700,9 +1714,19 @@ class FBXToAnimConverterApp:
         """Save default export directory from the settings entry."""
         path = self.settings_export_dir_entry.get().strip()
         self.settings["default_export_dir"] = path
+        try:
+            self.rotation_linear_epsilon = float(
+                self.rotation_epsilon_entry.get().strip()
+            )
+        except ValueError:
+            self.rotation_linear_epsilon = 3e-3
+            self.rotation_epsilon_entry.delete(0, tk.END)
+            self.rotation_epsilon_entry.insert(0, "0.003")
+
+        self.settings["rotation_linear_epsilon"] = self.rotation_linear_epsilon
         self.save_settings()
         self._update_export_all_state()
-        self.set_status(f"Default export folder saved: {path}", is_error=False)
+        self.set_status("Settings saved.", is_error=False)
 
 
     def save_settings(self):
