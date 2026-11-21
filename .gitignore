@@ -1,0 +1,7 @@
+.vs/
+__pycache__/
+*.py[cod]
+build/
+dist/
+local-presets/
+settings.json

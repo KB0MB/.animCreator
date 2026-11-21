@@ -1,4 +1,6 @@
 import os
+from collections import defaultdict
+from output_files import atomic_text, plan_exports
 
 from fbx import (
     FbxAnimLayer,
@@ -74,7 +76,7 @@ def simplify_linear_keys(keys, epsilon=1e-6):
 def collapse_flat_channel(axis_keys, start_time, flat_tolerance=0.045):
     """
     Collapse the whole channel to the animation start frame if every key
-    stays within ±flat_tolerance of the first value.
+    stays within Â±flat_tolerance of the first value.
 
     Example:
       base = 90.0
@@ -101,7 +103,7 @@ def collapse_flat_channel(axis_keys, start_time, flat_tolerance=0.045):
 def collapse_constant_channel(axis_keys, start_time, tolerance=1e-5):
     """
     Collapse the whole channel to the animation start frame if every key
-    stays within ±tolerance of the first value.
+    stays within Â±tolerance of the first value.
     Good for nearly constant location channels with tiny float wobble.
     """
     if len(axis_keys) <= 1:
@@ -256,6 +258,7 @@ def export_single_animation(
     auto_set_fps=True,
     reverse_animation=False,
     rotation_linear_epsilon=3e-3,
+    use_cubic_curves=False,
 ):
     """
     Export a single FBX AnimStack to a Maya .anim file.
@@ -264,6 +267,12 @@ def export_single_animation(
     - Skeleton-only export (no meshes/nulls/cameras).
     - Keys are shifted so animation starts at frame 1.
     """
+
+    if use_cubic_curves:
+        from graphExport import export_graph
+        return export_graph(anim_original, save_path, scene, ignored_bones,
+                            location_ignored_bones, write_scale, use_linear_reduction,
+                            auto_set_fps, reverse_animation, rotation_linear_epsilon)
 
     print(f"Exporting animation: {anim_original} to {save_path}")
     ignored_bones = ignored_bones or set()
@@ -279,26 +288,19 @@ def export_single_animation(
             break
 
     if not anim_stack:
-        print(f"Animation stack {anim_original} not found.")
-        return
+        raise ValueError(f"Animation stack {anim_original} not found.")
 
     bones = get_skeleton_bones_with_keyframes(anim_stack, scene, ignored_bones, auto_set_fps=auto_set_fps)
     if not bones:
-        print("No animated skeleton bones found.")
-        return
+        raise ValueError(f"No animated skeleton bones in {anim_original}.")
 
-    # Collect all key times (0-based) to compute end
-    all_key_times = [kf["time"] for _, keys in bones for kf in keys]
-
-    if all_key_times:
-        start_time = min(all_key_times)
-        end_time = max(all_key_times)
-    else:
-        start_time = 0
-        end_time = 0
+    # Keep the legacy clip range (including filtered channels) without a
+    # second clip-sized array of times.
+    start_time = min(k["time"] for _, keys in bones for k in keys)
+    end_time = max(k["time"] for _, keys in bones for k in keys)
 
     # Write .anim
-    with open(save_path, "w", encoding="utf-8") as f:
+    with atomic_text(save_path) as f:
         f.write("animVersion 1.1;\n")
         f.write("mayaVersion 2025;\n")
         f.write(f"timeUnit pal;\n")
@@ -310,6 +312,9 @@ def export_single_animation(
         for node, keyframes in bones:
             bone_name = node.GetName()
             child_count = node.GetChildCount()
+            by_curve = defaultdict(list)
+            for key in keyframes:
+                by_curve[key["curve"]].append(key)
 
             transforms = ["translate", "rotate"]
             if write_scale:
@@ -321,7 +326,7 @@ def export_single_animation(
 
                 for axis in ("X", "Y", "Z"):
                     curve_name = f"{transform}{axis}"  # e.g. translateX
-                    axis_keys = [k for k in keyframes if k["curve"] == curve_name]
+                    axis_keys = by_curve.get(curve_name)
                     if not axis_keys:
                         continue
 
@@ -343,6 +348,8 @@ def export_single_animation(
                                 linear_epsilon = 1e-6
                             elif transform == "rotate":
                                 linear_epsilon = rotation_linear_epsilon
+                            else:
+                                linear_epsilon = 1e-6
 
                             while True:
                                 new_axis_keys = simplify_linear_keys(axis_keys, epsilon=linear_epsilon)
@@ -389,29 +396,23 @@ def export_all_animations(
     animations,
     export_dir,
     scene,
-    ignored_bones=set(),
-    location_ignored_bones=set(),
+    ignored_bones=None,
+    location_ignored_bones=None,
     write_scale=True,
     use_linear_reduction=True,
     auto_set_fps=True,
     reverse_animation=False,
     rotation_linear_epsilon=3e-3,
+    use_cubic_curves=False,
 ):
     """
     animations can be:
       - list[str] of original stack names (legacy)
       - list[tuple[str,str]] of (original_stack, display_name) (new)
     """
-    if not os.path.exists(export_dir):
-        os.makedirs(export_dir)
-
-    for item in animations:
-        if isinstance(item, (tuple, list)) and len(item) >= 2:
-            original_stack, display_name = item[0], item[1]
-        else:
-            original_stack, display_name = item, item
-
-        save_path = os.path.join(export_dir, f"{display_name}.anim")
+    outputs = plan_exports(animations, export_dir)
+    os.makedirs(export_dir, exist_ok=True)
+    for original_stack, save_path in outputs:
         export_single_animation(
             original_stack,
             save_path,
@@ -423,6 +424,7 @@ def export_all_animations(
             auto_set_fps=auto_set_fps,
             reverse_animation=reverse_animation,
             rotation_linear_epsilon=rotation_linear_epsilon,
+            use_cubic_curves=use_cubic_curves,
         )
 
 def reverse_axis_keys(axis_keys, start_time, end_time):

@@ -8,7 +8,10 @@ from animExport import export_all_animations as export_all_anims
 from FBX_import import load_fbx_animations  # Import the actual FBX handler
 
 # Path for the settings.json file
-settings_file = "settings.json"
+from pathlib import Path
+from output_files import atomic_text
+
+settings_file = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "AnimCreator" / "settings.json"
 
 # Define color themes (including additional ones)
 color_themes = {
@@ -53,6 +56,7 @@ class FBXToAnimConverterApp:
         
         # Load settings from the JSON file
         self.settings = self.load_settings()
+        self.use_cubic_curves = tk.BooleanVar(value=self.settings.get("use_cubic_curves", False))
 
         self.rotation_linear_epsilon = float(
             self.settings.get("rotation_linear_epsilon", 3e-3)
@@ -104,7 +108,7 @@ class FBXToAnimConverterApp:
 
         if os.path.exists(settings_file):
             try:
-                with open(settings_file, "r", encoding="utf-8") as f:
+                with open(settings_file, "r", encoding="utf-8-sig") as f:
                     settings = json.load(f)
             except Exception:
                 settings = {}
@@ -1199,7 +1203,7 @@ class FBXToAnimConverterApp:
 
     def build_settings_frame(self):
         """Build the settings frame UI."""
-        self.settings_frame = ctk.CTkFrame(self.root)
+        self.settings_frame = ctk.CTkScrollableFrame(self.root)
         self.settings_frame.pack_forget()
 
         # Back Button
@@ -1235,7 +1239,9 @@ class FBXToAnimConverterApp:
         )
         self.auto_fps_toggle_button.pack(pady=(5, 10))
 
-        ctk.CTkLabel(self.settings_frame, text="Rotation Clean Epsilon:").pack(pady=(10, 6))
+        ctk.CTkCheckBox(self.settings_frame, text="Cubic curves (updated Toolbox)",
+                       variable=self.use_cubic_curves).pack(pady=(10, 6))
+        ctk.CTkLabel(self.settings_frame, text="Rotation Error Tolerance (degrees):").pack(pady=(10, 6))
 
         self.rotation_epsilon_entry = ctk.CTkEntry(self.settings_frame, width=120)
         self.rotation_epsilon_entry.insert(0, str(self.rotation_linear_epsilon))
@@ -1349,15 +1355,19 @@ class FBXToAnimConverterApp:
 
     def select_fbx_file(self):
         """Handles the selection of an FBX file, loads animations, and retrieves bone names."""
-        self.fbx_file = filedialog.askopenfilename(
+        chosen = filedialog.askopenfilename(
             title="Select FBX File",
             filetypes=[("FBX files", "*.fbx")]
         )
-        if not self.fbx_file:
+        if not chosen:
+            return
+        try:
+            animations, bone_names, scene, manager = load_fbx_animations(chosen, use_bone_paths=True)
+        except Exception as error:
+            self.set_status(f"Error loading FBX file: {error}", is_error=True, source="fbx_import")
             return
 
         try:
-            # Destroy previously loaded FBX first
             self._destroy_current_fbx()
 
             # Close any currently open bone windows from the previous FBX
@@ -1374,11 +1384,7 @@ class FBXToAnimConverterApp:
                 pass
 
             # load_fbx_animations returns (animations, bones, scene, manager)
-            animations, bone_names, scene, manager = load_fbx_animations(
-                self.fbx_file,
-                use_bone_paths=True
-            )
-
+            self.fbx_file = chosen
             self.fbx_manager = manager
             self.animations_with_originals = animations
             self.animations = [name for _, name in animations]
@@ -1631,12 +1637,7 @@ class FBXToAnimConverterApp:
         idx = sel[0]
         display_name = self.anim_listbox.get(idx)
 
-        # Find original stack name
-        anim_stack = None
-        for stack_name, disp in self.animations_with_originals:
-            if disp == display_name:
-                anim_stack = stack_name
-                break
+        anim_stack = self.animations_with_originals[idx][0]
 
         if not anim_stack:
             self.set_status("Error: Animation stack not found.", is_error=True)
@@ -1651,7 +1652,7 @@ class FBXToAnimConverterApp:
             self.set_status("Export canceled.", is_error=True)
             return
 
-        export_anim(
+        if not self.run_export(export_anim,
             anim_stack,
             save_path,
             self.scene,
@@ -1662,7 +1663,9 @@ class FBXToAnimConverterApp:
             auto_set_fps=self.auto_set_fps,
             reverse_animation=self.reverse_animation,
             rotation_linear_epsilon=self.rotation_linear_epsilon,
-        )
+            use_cubic_curves=self.use_cubic_curves.get(),
+        ):
+            return
 
 
         self.set_status(f"Exported {display_name}\n{save_path}", is_error=False)
@@ -1679,7 +1682,7 @@ class FBXToAnimConverterApp:
 
         os.makedirs(export_dir, exist_ok=True)
 
-        export_all_anims(
+        if not self.run_export(export_all_anims,
             self.animations_with_originals,
             export_dir,
             self.scene,
@@ -1690,9 +1693,19 @@ class FBXToAnimConverterApp:
             auto_set_fps=self.auto_set_fps,
             reverse_animation=self.reverse_animation,
             rotation_linear_epsilon=self.rotation_linear_epsilon,
-        )
+            use_cubic_curves=self.use_cubic_curves.get(),
+        ):
+            return
 
         self.set_status("All animations exported successfully!", is_error=False)
+
+    def run_export(self, exporter, *args, **kwargs):
+        try:
+            exporter(*args, **kwargs)
+            return True
+        except Exception as error:
+            self.set_status(f"Export failed: {error}", is_error=True)
+            return False
 
     def select_export_directory(self):
         self.export_dir = filedialog.askdirectory(title="Select Custom Export Directory")
@@ -1724,6 +1737,7 @@ class FBXToAnimConverterApp:
             self.rotation_epsilon_entry.insert(0, "0.003")
 
         self.settings["rotation_linear_epsilon"] = self.rotation_linear_epsilon
+        self.settings["use_cubic_curves"] = self.use_cubic_curves.get()
         self.save_settings()
         self._update_export_all_state()
         self.set_status("Settings saved.", is_error=False)
@@ -1732,7 +1746,8 @@ class FBXToAnimConverterApp:
     def save_settings(self):
         self.settings["window_position"] = f"{self.root.winfo_x()}x{self.root.winfo_y()}"
 
-        with open(settings_file, 'w') as f:
+        Path(settings_file).parent.mkdir(parents=True, exist_ok=True)
+        with atomic_text(settings_file) as f:
             json.dump(self.settings, f, indent=4)
 
     def apply_saved_theme(self):
