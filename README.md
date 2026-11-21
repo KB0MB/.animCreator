@@ -8,7 +8,7 @@ Open your FBX, pick a clip, and press **Ctrl+E** to choose where to save it. For
 
 In the bone picker, click a bone to select just that bone, or Shift-click to include its children. Ctrl-click its arrow to expand the whole branch. You can also skip just a bone's location keys and keep its rotation.
 
-Leave **Auto FPS** on to read frame numbers at the FBX scene's frame rate. The default exporter uses linear keys. With an updated Toolbox, you can turn on **Cubic curves** in Settings to keep curved motion without writing a key on every frame. Older Toolbox builds flatten those tangents, so stick to linear export with those. See [the cubic export notes](CUBIC_WORKFLOW.md) for the differences and tested file sizes.
+Leave **Auto FPS** on to read frame numbers at the FBX scene's frame rate. The default exporter uses linear keys. With an custom Toolbox, you can turn on **Cubic curves** in Settings to keep curved motion without writing a key on every frame. Older Toolbox builds flatten those tangents, so stick to linear export with those. See [the cubic export notes](CUBIC_WORKFLOW.md) for the differences and tested file sizes.
 
 ## Running it
 
@@ -22,4 +22,4 @@ python .anim_Creator.py
 
 To build the Windows app, install PyInstaller in the same Python environment and run `python -m PyInstaller animCreator.spec`. The executable will be in `dist/animCreator/`.
 
-**Older Toolbox builds:** If imported clips have the wrong frame count or bones without scale or location tracks come in broken, check whether you're still using the old 22 KB `Lib/BrawlboxHelper.dll`. Use the updated helper for that build.
+**Vanilla Toolbox builds:** If imported clips have the wrong frame count or bones without scale or location tracks come in broken, check whether you're still using the old 22 KB `Lib/BrawlboxHelper.dll`. Use the updated helper for that build.
